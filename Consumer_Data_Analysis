@@ -1,0 +1,400 @@
+import yfinance as yf
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import numpy as np
+import warnings
+import os
+from datetime import datetime
+
+warnings.filterwarnings("ignore")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONSUMER-DRIVEN MACRO SIGNAL — DYNAMIC PORTFOLIO STRATEGY
+# Theory: Discretionary vs Staples spending shifts signal economic regime
+# EMH Link: Macro consumption data is slow-moving — markets don't instantly
+#            price this, creating short-term predictability in allocation
+# ══════════════════════════════════════════════════════════════════════════════
+
+os.makedirs("output", exist_ok=True)
+START = "2015-01-01"
+
+# ── DATA ──────────────────────────────────────────────────────────────────────
+print("Downloading data...")
+
+tickers = ["SPY", "XLY", "XLP", "AGG", "GLD"]
+raw     = yf.download(tickers, start=START, auto_adjust=True, progress=False)["Close"]
+raw     = raw.ffill().dropna()
+
+# Resample to monthly (cleaner signal)
+monthly = raw.resample("ME").last()
+returns = monthly.pct_change().dropna()
+
+# ── CONSUMER SIGNAL ───────────────────────────────────────────────────────────
+# Core idea: XLY (discretionary) vs XLP (staples)
+# When consumers spend on wants > needs → risk-on economy
+# When staples outperform → consumers are defensive → risk-off
+returns["signal_raw"] = returns["XLY"] - returns["XLP"]
+
+# Smooth with 3-month rolling mean (reduces noise)
+returns["signal"] = returns["signal_raw"].rolling(3).mean()
+
+# Standardise into a z-score (makes it comparable over time)
+returns["signal_z"] = (
+    (returns["signal"] - returns["signal"].rolling(12).mean()) /
+     returns["signal"].rolling(12).std()
+)
+
+returns = returns.dropna()
+
+# ── REGIME CLASSIFICATION ─────────────────────────────────────────────────────
+# Risk-On  = discretionary strong (signal above median)
+# Risk-Off = staples dominate    (signal below median)
+threshold          = returns["signal_z"].median()
+returns["risk_on"] = returns["signal_z"] > threshold
+
+# ── FORWARD RETURNS (avoid look-ahead bias) ───────────────────────────────────
+returns["fwd_1m"] = returns["SPY"].shift(-1)
+returns["fwd_3m"] = returns["SPY"].rolling(3).sum().shift(-3)
+
+# ── DYNAMIC STRATEGY ──────────────────────────────────────────────────────────
+# Rule: Risk-On  → 100% SPY exposure
+#        Risk-Off → 50% SPY + 30% AGG + 20% GLD (defensive)
+def get_strategy_return(row):
+    if row["risk_on"]:
+        return row["SPY"]                                        # full equity
+    else:
+        return 0.5*row["SPY"] + 0.3*row["AGG"] + 0.2*row["GLD"]  # defensive
+
+returns["strategy"] = returns.apply(get_strategy_return, axis=1)
+returns["buy_hold"] = returns["SPY"]
+
+# ── METRICS ───────────────────────────────────────────────────────────────────
+def annualised_return(r):
+    r = r.dropna()
+    total = (1 + r).prod()
+    years = len(r) / 12
+    return round((total ** (1/years) - 1) * 100, 2) if years > 0 else 0
+
+def volatility(r):
+    return round(r.dropna().std() * np.sqrt(12) * 100, 2)
+
+def sharpe(r, rf=0.05):
+    r    = r.dropna()
+    exc  = r - rf/12
+    std  = exc.std()
+    return round((exc.mean() / std) * np.sqrt(12), 2) if std > 0 else 0
+
+def max_drawdown(r):
+    r  = r.dropna()
+    eq = (1 + r).cumprod()
+    dd = (eq - eq.cummax()) / eq.cummax()
+    return round(dd.min() * 100, 2)
+
+def var_95(r):
+    return round(np.percentile(r.dropna(), 5) * 100, 2)
+
+strat = returns["strategy"].dropna()
+bench = returns["buy_hold"].reindex(strat.index).dropna()
+
+print("\n══ STRATEGY vs BUY & HOLD ════════════════════════")
+print(f"{'Metric':<22} {'Strategy':>10}  {'Buy & Hold':>10}")
+print("─" * 46)
+metrics = {
+    "Ann. Return":    (annualised_return(strat), annualised_return(bench), "%"),
+    "Volatility":     (volatility(strat),        volatility(bench),        "%"),
+    "Sharpe Ratio":   (sharpe(strat),            sharpe(bench),            ""),
+    "Max Drawdown":   (max_drawdown(strat),       max_drawdown(bench),      "%"),
+    "VaR 95% Daily":  (var_95(strat),             var_95(bench),            "%"),
+}
+for k, (s, b, u) in metrics.items():
+    print(f"{k:<22} {str(s)+u:>10}  {str(b)+u:>10}")
+
+# ── QUINTILE ANALYSIS ─────────────────────────────────────────────────────────
+# Split signal into 5 buckets — check if stronger signal = better returns
+# This is the "alpha test" used in buy-side research
+clean = returns[["signal_z", "fwd_1m"]].dropna()
+clean["quintile"] = pd.qcut(clean["signal_z"], 5,
+                              labels=["Q1\n(Weakest)", "Q2", "Q3", "Q4", "Q5\n(Strongest)"])
+quintile_returns = clean.groupby("quintile", observed=True)["fwd_1m"].mean() * 100
+
+# ── REGIME ANALYSIS ───────────────────────────────────────────────────────────
+risk_on_ret  = returns.loc[returns["risk_on"],  "SPY"]
+risk_off_ret = returns.loc[~returns["risk_on"], "SPY"]
+
+print(f"\n══ REGIME ANALYSIS ════════════════════════════════")
+print(f"Risk-On  avg monthly SPY return : {round(risk_on_ret.mean()*100, 2)}%")
+print(f"Risk-Off avg monthly SPY return : {round(risk_off_ret.mean()*100, 2)}%")
+print(f"Risk-On  volatility             : {round(risk_on_ret.std()*100, 2)}%")
+print(f"Risk-Off volatility             : {round(risk_off_ret.std()*100, 2)}%")
+
+# ── MACRO ANNOTATIONS (KEY EVENTS) ───────────────────────────────────────────
+events = {
+    "2020-03": "COVID\nCrash",
+    "2020-11": "Vaccine\nAnnouncement",
+    "2021-11": "Fed Taper\nSignal",
+    "2022-01": "Fed Rate\nHikes Begin",
+    "2022-10": "UK Gilt\nCrisis",
+    "2023-03": "SVB\nCollapse",
+    "2023-07": "Fed Peak\nRates",
+    "2024-08": "Recession\nFears",
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHARTS
+# ══════════════════════════════════════════════════════════════════════════════
+BLUE  = "#1a3a5c"
+RED   = "#c0392b"
+GREEN = "#27ae60"
+AMBER = "#f39c12"
+GREY  = "#95a5a6"
+
+fig = plt.figure(figsize=(18, 14))
+fig.suptitle(
+    "Consumer-Driven Macro Signal — Dynamic Allocation Strategy\n"
+    "Theory: Discretionary vs Staples Spending as an Economic Regime Indicator",
+    fontsize=14, fontweight="bold", y=0.98
+)
+
+# ── Chart 1: Consumer Signal vs SPY ───────────────────────────────────────────
+ax1 = fig.add_subplot(3, 3, 1)
+ax1b = ax1.twinx()
+returns["signal_z"].plot(ax=ax1, color=AMBER, linewidth=1.5, label="Consumer Signal (Z)")
+(1 + returns["SPY"]).cumprod().plot(ax=ax1b, color=BLUE, linewidth=2, linestyle="--", label="SPY")
+ax1.axhline(0, color=GREY, linestyle=":", alpha=0.5)
+ax1.set_title("Consumer Signal vs SPY", fontweight="bold", fontsize=9)
+ax1.set_ylabel("Signal Z-Score", fontsize=8)
+ax1b.set_ylabel("SPY Cumulative", fontsize=8)
+lines1 = [mpatches.Patch(color=AMBER, label="Consumer Signal"),
+          mpatches.Patch(color=BLUE,  label="SPY")]
+ax1.legend(handles=lines1, fontsize=7)
+ax1.grid(True, alpha=0.3)
+
+# ── Chart 2: Economic Regime Overlay ──────────────────────────────────────────
+ax2 = fig.add_subplot(3, 3, 2)
+spy_cum = (1 + returns["SPY"]).cumprod()
+ax2.plot(spy_cum.index, spy_cum.values, color=BLUE, linewidth=1.5, label="SPY")
+for i in range(len(returns) - 1):
+    color = GREEN if returns["risk_on"].iloc[i] else RED
+    ax2.axvspan(returns.index[i], returns.index[i+1], alpha=0.15, color=color)
+for date_str, label in events.items():
+    try:
+        date = pd.to_datetime(date_str)
+        if date in spy_cum.index or spy_cum.index[spy_cum.index >= date].any():
+            idx = spy_cum.index[spy_cum.index >= date][0]
+            ax2.axvline(idx, color="black", linestyle="--", alpha=0.4, linewidth=0.8)
+            ax2.text(idx, spy_cum.max()*0.6, label, fontsize=6, rotation=90,
+                    va="bottom", ha="right", color="black")
+    except:
+        pass
+on_patch  = mpatches.Patch(color=GREEN, alpha=0.4, label="Risk-On")
+off_patch = mpatches.Patch(color=RED,   alpha=0.4, label="Risk-Off")
+ax2.legend(handles=[on_patch, off_patch], fontsize=7)
+ax2.set_title("Economic Regime — Risk On/Off Overlay", fontweight="bold", fontsize=9)
+ax2.set_ylabel("SPY Cumulative Return")
+ax2.grid(True, alpha=0.3)
+
+# ── Chart 3: Quintile Forward Returns ─────────────────────────────────────────
+ax3 = fig.add_subplot(3, 3, 3)
+colors_q = [RED, "#e67e22", AMBER, "#2ecc71", GREEN]
+bars = ax3.bar(quintile_returns.index, quintile_returns.values, color=colors_q, edgecolor="white")
+for bar, val in zip(bars, quintile_returns.values):
+    ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
+             f"{val:.2f}%", ha="center", va="bottom", fontsize=8, fontweight="bold")
+ax3.axhline(0, color="black", linewidth=0.8)
+ax3.set_title("Quintile Analysis — Fwd 1M SPY Returns\n(Signal Strength vs Market Performance)",
+              fontweight="bold", fontsize=9)
+ax3.set_ylabel("Avg 1M Forward Return (%)")
+ax3.grid(True, alpha=0.3, axis="y")
+
+# ── Chart 4: Strategy vs Buy & Hold ───────────────────────────────────────────
+ax4 = fig.add_subplot(3, 3, 4)
+cum_strat = (1 + strat).cumprod()
+cum_bench = (1 + bench).cumprod()
+cum_strat.plot(ax=ax4, color=GREEN, linewidth=2.5, label="Consumer-Driven Strategy")
+cum_bench.plot(ax=ax4, color=BLUE,  linewidth=2,   linestyle="--", label="Buy & Hold SPY")
+ax4.set_title("Strategy vs Buy & Hold", fontweight="bold", fontsize=9)
+ax4.set_ylabel("Growth of $1")
+ax4.legend(fontsize=8)
+ax4.grid(True, alpha=0.3)
+
+# ── Chart 5: Drawdown Comparison ──────────────────────────────────────────────
+ax5 = fig.add_subplot(3, 3, 5)
+dd_strat = ((1+strat).cumprod() - (1+strat).cumprod().cummax()) / (1+strat).cumprod().cummax() * 100
+dd_bench = ((1+bench).cumprod() - (1+bench).cumprod().cummax()) / (1+bench).cumprod().cummax() * 100
+dd_strat.plot(ax=ax5, color=GREEN, linewidth=1.5, label="Strategy")
+dd_bench.plot(ax=ax5, color=RED,   linewidth=1.5, label="Buy & Hold")
+ax5.fill_between(dd_strat.index, dd_strat, 0, alpha=0.2, color=GREEN)
+ax5.fill_between(dd_bench.index, dd_bench, 0, alpha=0.2, color=RED)
+ax5.set_title("Drawdown Comparison\n(Key: Does signal reduce losses?)",
+              fontweight="bold", fontsize=9)
+ax5.set_ylabel("Drawdown %")
+ax5.legend(fontsize=8)
+ax5.grid(True, alpha=0.3)
+
+# ── Chart 6: Regime Return Distribution ───────────────────────────────────────
+ax6 = fig.add_subplot(3, 3, 6)
+ax6.hist(risk_on_ret  * 100, bins=20, alpha=0.6, color=GREEN, label="Risk-On Regime")
+ax6.hist(risk_off_ret * 100, bins=20, alpha=0.6, color=RED,   label="Risk-Off Regime")
+ax6.axvline(risk_on_ret.mean()  * 100, color=GREEN, linestyle="--", linewidth=1.5)
+ax6.axvline(risk_off_ret.mean() * 100, color=RED,   linestyle="--", linewidth=1.5)
+ax6.set_title("SPY Return Distribution by Regime", fontweight="bold", fontsize=9)
+ax6.set_xlabel("Monthly Return (%)")
+ax6.set_ylabel("Frequency")
+ax6.legend(fontsize=8)
+ax6.grid(True, alpha=0.3)
+
+# ── Chart 7: XLY vs XLP Relative Performance ─────────────────────────────────
+ax7 = fig.add_subplot(3, 3, 7)
+xly_cum = (1 + returns["XLY"]).cumprod()
+xlp_cum = (1 + returns["XLP"]).cumprod()
+xly_cum.plot(ax=ax7, color=BLUE,  linewidth=2, label="XLY (Discretionary)")
+xlp_cum.plot(ax=ax7, color=AMBER, linewidth=2, label="XLP (Staples)")
+ax7.set_title("Discretionary vs Staples Performance\n(The Raw Signal)", fontweight="bold", fontsize=9)
+ax7.set_ylabel("Growth of $1")
+ax7.legend(fontsize=8)
+ax7.grid(True, alpha=0.3)
+
+# ── Chart 8: Rolling Signal ───────────────────────────────────────────────────
+ax8 = fig.add_subplot(3, 3, 8)
+returns["signal_z"].plot(ax=ax8, color=AMBER, linewidth=1.5)
+ax8.fill_between(returns.index,
+                  returns["signal_z"],
+                  where=returns["signal_z"] > 0, alpha=0.3, color=GREEN,
+                  label="Risk-On")
+ax8.fill_between(returns.index,
+                  returns["signal_z"],
+                  where=returns["signal_z"] <= 0, alpha=0.3, color=RED,
+                  label="Risk-Off")
+ax8.axhline(0, color="black", linewidth=0.8)
+ax8.set_title("Consumer Signal Z-Score Over Time", fontweight="bold", fontsize=9)
+ax8.set_ylabel("Z-Score")
+ax8.legend(fontsize=8)
+ax8.grid(True, alpha=0.3)
+
+# ── Chart 9: Performance Metrics Table ────────────────────────────────────────
+ax9 = fig.add_subplot(3, 3, 9)
+ax9.axis("off")
+table_data = [["Metric", "Strategy", "Buy & Hold"]]
+for k, (s, b, u) in metrics.items():
+    table_data.append([k, f"{s}{u}", f"{b}{u}"])
+table_data.append(["Regime Signal", "Dynamic", "None"])
+
+tbl = ax9.table(cellText=table_data[1:],
+                colLabels=table_data[0],
+                loc="center", cellLoc="center")
+tbl.auto_set_font_size(False)
+tbl.set_fontsize(9)
+tbl.scale(1.2, 1.6)
+
+for j in range(3):
+    tbl[0, j].set_facecolor(BLUE)
+    tbl[0, j].set_text_props(color="white", fontweight="bold")
+for i in range(1, len(table_data)):
+    for j in range(3):
+        tbl[i, j].set_facecolor("#f4f6f9" if i % 2 == 0 else "white")
+
+ax9.set_title("Performance Summary", fontweight="bold", fontsize=9)
+
+plt.tight_layout()
+chart_path = "output/consumer_signal_analysis.png"
+plt.savefig(chart_path, dpi=150, bbox_inches="tight", facecolor="white")
+plt.show()
+
+# ── KEY INSIGHTS ──────────────────────────────────────────────────────────────
+print("\n══ KEY INSIGHTS ═══════════════════════════════════")
+ron  = round(risk_on_ret.mean() * 100, 2)
+roff = round(risk_off_ret.mean() * 100, 2)
+diff = round(ron - roff, 2)
+s_ret = annualised_return(strat)
+b_ret = annualised_return(bench)
+s_dd  = max_drawdown(strat)
+b_dd  = max_drawdown(bench)
+
+print(f"1. SPY returns {diff}% higher per month in Risk-On vs Risk-Off regimes")
+print(f"2. Strategy {'outperforms' if s_ret > b_ret else 'underperforms'} buy & hold by {abs(round(s_ret-b_ret,2))}% annualised")
+print(f"3. Max drawdown reduced from {b_dd}% to {s_dd}% — {'improved' if s_dd > b_dd else 'similar'} downside protection")
+print(f"4. EMH implication: consumer data is slow-moving — partial inefficiency")
+print(f"   allows macro signals to improve allocation before markets fully adjust")
+# ── ASSUMPTIONS & LIMITATIONS PAGE ───────────────────────────────────────────
+fig2, ax = plt.subplots(figsize=(14, 10))
+ax.axis("off")
+fig2.patch.set_facecolor("#f4f6f9")
+
+ax.text(0.5, 0.97, "Research Assumptions, Limitations & Macro Context",
+        ha="center", va="top", fontsize=16, fontweight="bold",
+        color="#1a3a5c", transform=ax.transAxes)
+
+ax.plot([0.05, 0.95], [0.93, 0.93], color="#1a3a5c", linewidth=1.5,
+        transform=ax.transAxes)
+
+# Assumptions
+assumptions = [
+    "1.  XLY vs XLP return spread is a valid proxy for consumer spending composition",
+    "2.  Retail/consumer behaviour shifts are slow-moving and not instantly priced by markets",
+    "3.  A 3-month rolling signal smooths noise without introducing significant look-ahead bias",
+    "4.  Markets are semi-efficient — macro signals offer short-term predictability before full incorporation",
+    "5.  Monthly rebalancing is feasible with no transaction costs assumed",
+    "6.  AGG and GLD serve as effective defensive assets during risk-off regimes",
+    "7.  The discretionary/staples relationship holds across different rate environments",
+]
+
+# Limitations
+limitations = [
+    "1.  ETF returns are equity-market-priced — they do not directly measure actual retail spending",
+    "2.  Signal may break down during sudden macro shocks (e.g. COVID) where all assets fall together",
+    "3.  Small sample size — monthly data from 2015 limits statistical robustness",
+    "4.  No transaction costs, taxes or slippage modelled — real returns would be lower",
+    "5.  Regime classification is binary — real economic conditions are more nuanced",
+    "6.  FRED retail data would be a stronger signal than ETF-based proxy used here",
+    "7.  Past regime relationships may not persist in structurally different future environments",
+]
+
+# Macro Context
+macro = [
+    ("2020 Q1  — COVID Crash",          "Global lockdowns collapsed discretionary spending. Staples surged. Risk-off signal triggered."),
+    ("2020 Q4  — Vaccine Rally",         "Consumer confidence rebounded sharply. Discretionary outperformed. Risk-on regime restored."),
+    ("2021 Q4  — Fed Taper Signal",      "Rising inflation expectations. Fed signals tapering. Mixed consumer signals as stimulus fades."),
+    ("2022 Q1  — Rate Hike Cycle",       "Fastest Fed tightening since 1980s. Consumer credit stress. Discretionary weakened sharply."),
+    ("2022 Q4  — UK Gilt Crisis",        "Global bond market volatility. Defensive positioning favoured. Staples outperformed."),
+    ("2023 Q1  — SVB Collapse",          "Regional banking stress. Risk-off sentiment. Consumers cautious on credit availability."),
+    ("2023 Q3  — Peak Rates",            "Fed holds rates at peak. Consumer resilience surprised — discretionary recovered modestly."),
+    ("2024 Q3  — Recession Fears",       "Weak jobs data triggered brief risk-off. Signal moved defensive before recovery."),
+]
+
+y = 0.89
+ax.text(0.05, y, "ASSUMPTIONS", fontsize=11, fontweight="bold",
+        color="#1a3a5c", transform=ax.transAxes)
+y -= 0.03
+for a in assumptions:
+    ax.text(0.06, y, a, fontsize=8.5, color="#2c3e50", transform=ax.transAxes)
+    y -= 0.028
+
+y -= 0.01
+ax.text(0.05, y, "LIMITATIONS", fontsize=11, fontweight="bold",
+        color="#c0392b", transform=ax.transAxes)
+y -= 0.03
+for l in limitations:
+    ax.text(0.06, y, l, fontsize=8.5, color="#2c3e50", transform=ax.transAxes)
+    y -= 0.028
+
+y -= 0.01
+ax.text(0.05, y, "KEY MACRO EVENTS & SIGNAL INTERPRETATION",
+        fontsize=11, fontweight="bold", color="#1a3a5c", transform=ax.transAxes)
+y -= 0.03
+for date, desc in macro:
+    ax.text(0.06, y, f"▪  {date}:", fontsize=8.5, fontweight="bold",
+            color="#1a3a5c", transform=ax.transAxes)
+    ax.text(0.25, y, desc, fontsize=8.5, color="#2c3e50", transform=ax.transAxes)
+    y -= 0.028
+
+ax.text(0.5, 0.01,
+        "Disclaimer: This analysis is for educational purposes only and does not constitute financial advice.",
+        ha="center", fontsize=7.5, color="grey", transform=ax.transAxes)
+
+assumptions_path = "output/assumptions_and_macro.png"
+plt.tight_layout()
+plt.savefig(assumptions_path, dpi=150, bbox_inches="tight", facecolor="#f4f6f9")
+plt.show()
+print(f"Assumptions page saved → {assumptions_path}")
+

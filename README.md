@@ -59,7 +59,11 @@ Convert the signal into a rolling z-score using a 12-month lookback window.
 | Risk-On | 100% SPY |
 | Risk-Off | 50% SPY / 30% AGG / 20% GLD |
 
-Portfolio weights are rebalanced monthly.
+Portfolio weights are rebalanced monthly. 
+
+(Rolling 12 = 1 year lookback window
+Above 0 = discretionary stronger than its 1-year average → risk-on
+Below 0 = discretionary weaker than its 1-year average → risk-off)
 
 ---
 
